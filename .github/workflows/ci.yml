@@ -1,0 +1,206 @@
+# ================================================================
+# GitHub Actions CI Pipeline
+# Repository : github.com/its-kapil/Maven-Project-Nexus
+# Generated  : 2026-03-27 by AI CI/CD Pipeline Builder
+# Description: Build -> Test -> Security Scan -> Deploy to Nexus
+# ================================================================
+
+name: "Maven CI - Build, Test & Deploy to Nexus"
+
+on:
+  push:
+    branches: [ main, master, develop, 'feature/**', 'release/**' ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Force deploy to Nexus?'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  JAVA_VERSION: '11'
+  MAVEN_OPTS: '-Xmx2g -XX:+TieredCompilation -XX:TieredStopAtLevel=1'
+  NEXUS_URL: ${{ secrets.NEXUS_URL }}
+
+jobs:
+
+  # Job 1: Build & Test
+  build-and-test:
+    name: "Build & Test"
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+
+    steps:
+      - name: "Checkout Repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "Set up JDK 11 (Temurin)"
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: "Get Project Version from pom.xml"
+        id: get-version
+        run: |
+          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Project version: $VERSION"
+
+      - name: "Compile Source Code"
+        run: |
+          mvn clean compile \
+            -B \
+            -Dproject.build.sourceEncoding=UTF-8 \
+            --no-transfer-progress
+
+      - name: "Run Unit Tests"
+        run: |
+          mvn test \
+            -B \
+            --no-transfer-progress
+
+      - name: "Generate JaCoCo Coverage Report"
+        run: mvn jacoco:report -B --no-transfer-progress
+
+      - name: "Upload Test Results"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ github.run_number }}
+          path: target/surefire-reports/
+          retention-days: 14
+
+      - name: "Upload Coverage Report"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report-${{ github.run_number }}
+          path: target/site/jacoco/
+          retention-days: 14
+
+  # Job 2: Security Scan
+  security-scan:
+    name: "Security Scan"
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Set up JDK 11"
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: "OWASP Dependency Check"
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: Maven-Project-Nexus
+          path: .
+          format: HTML
+          args: --failOnCVSS 7 --enableRetired --enableExperimental
+
+      - name: "Upload OWASP Report"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: owasp-report-${{ github.run_number }}
+          path: reports/
+          retention-days: 30
+
+      - name: "Gitleaks - Secrets Detection"
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+      - name: "Initialize CodeQL"
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java
+          queries: security-and-quality
+
+      - name: "CodeQL - SAST Analysis"
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:java
+
+  # Job 3: Package & Deploy to Nexus
+  deploy-to-nexus:
+    name: "Package & Deploy to Nexus"
+    runs-on: ubuntu-latest
+    needs: [ build-and-test, security-scan ]
+    if: |
+      github.ref == 'refs/heads/main' ||
+      github.ref == 'refs/heads/master' ||
+      github.ref == 'refs/heads/develop' ||
+      github.event.inputs.deploy == 'true'
+    environment: nexus-deploy
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Set up JDK 11"
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: "Package Application (JAR)"
+        run: |
+          mvn package -DskipTests -B --no-transfer-progress
+          echo "Built: $(ls target/*.jar)"
+
+      - name: "Upload JAR Artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: maven-jar-${{ github.run_number }}
+          path: target/*.jar
+          retention-days: 30
+
+      - name: "Deploy to Nexus Repository"
+        run: |
+          mvn deploy \
+            -DskipTests \
+            -B \
+            --no-transfer-progress \
+            --settings .github/settings.xml \
+            -DaltDeploymentRepository=nexus::default::${{ env.NEXUS_URL }}/repository/maven-snapshots
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+      - name: "Notify Slack on Success"
+        uses: slackapi/slack-github-action@v1.26.0
+        if: success()
+        with:
+          payload: |
+            {
+              "text": "Maven-Project-Nexus build #${{ github.run_number }} deployed to Nexus! Branch: ${{ github.ref_name }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: "Notify Slack on Failure"
+        uses: slackapi/slack-github-action@v1.26.0
+        if: failure()
+        with:
+          payload: |
+            {
+              "text": "Maven-Project-Nexus build #${{ github.run_number }} FAILED! Branch: ${{ github.ref_name }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
